@@ -1,0 +1,52 @@
+# Python cache and compiled files
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.pkl
+
+# Virtual environment
+.env
+.venv/
+env/
+venv/
+
+# Environment variables and secrets
+*.env
+*.env.*
+secrets.json
+
+# Airflow
+logs/
+dags/__pycache__/
+plugins/__pycache__/
+airflow.db
+airflow.cfg
+unittests.cfg
+
+# Docker
+*.pid
+**/docker-compose.override.yml
+**/docker-compose.local.yml
+**/docker-compose.dev.yml
+
+# Kafka / Data directories
+data/
+tmp/
+*.log
+
+# MLflow
+mlruns/
+mlartifacts/
+
+# MinIO
+minio_data/
+
+# IDE / Editor settings
+.vscode/
+.idea/
+*.swp
+
+# System files
+.DS_Store
+Thumbs.db

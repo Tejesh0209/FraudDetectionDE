@@ -1,0 +1,18 @@
+mlflow:
+  experiment_name: 'fraud_detection_v1'
+  registered_model_name: 'fraud_detection_XGBOOST'
+  tracking_uri: "http://mlflow-server:5500"
+  artifact_location: "s3://mlflow/fraud_Detection"
+  s3_endpoint_url: "http://minio:9000"
+
+kafka:
+  
+
+features:
+
+
+modlel:
+
+
+spark:
+

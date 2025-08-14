@@ -1,0 +1,380 @@
+version: '3.8'
+
+x-airflow-common:
+  &airflow-common
+  build: ./airflow
+  image: airflow-training:newv1
+  platform: linux/amd64  # Added for ARM64 host compatibility
+  environment:
+    &airflow-common-env
+    AIRFLOW__CORE__EXECUTOR: CeleryExecutor
+    AIRFLOW__CORE__AUTH_MANAGER: airflow.providers.fab.auth_manager.fab_auth_manager.FabAuthManager
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/airflow
+    AIRFLOW__CELERY__RESULT_BACKEND: db+postgresql://airflow:airflow@postgres/airflow
+    AIRFLOW__CELERY__BROKER_URL: redis://:@redis:6379/0
+    AIRFLOW__CORE__FERNET_KEY: ''
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: 'true'
+    AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
+    AIRFLOW__SCHEDULER__ENABLE_HEALTH_CHECK: 'true'
+    _PIP_ADDITIONAL_REQUIREMENTS: ${_PIP_ADDITIONAL_REQUIREMENTS:-}
+    MLFLOW_TRACKING_URI: 'http://mlflow-server:5500'
+    MLFLOW_S3_ENDPOINT_URL: 'http://minio:9000'
+    # propagate desired runtime user/group (set in .env)
+    AIRFLOW_UID: ${AIRFLOW_UID:-50000}
+    AIRFLOW_GID: ${AIRFLOW_GID:-0}
+  volumes:
+    - ${AIRFLOW_PROJ_DIR:-.}/dags:/opt/airflow/dags
+    - ${AIRFLOW_PROJ_DIR:-.}/logs:/opt/airflow/logs
+    - ${AIRFLOW_PROJ_DIR:-.}/config:/opt/airflow/config
+    - ${AIRFLOW_PROJ_DIR:-.}/plugins:/opt/airflow/plugins
+    - ./models:/app/models
+    - ./config.yaml:/app/config.yaml:ro
+    - ./.env:/app/.env:ro
+  # run container processes as the airflow UID (default 50000) and AIRFLOW_GID
+  user: "${AIRFLOW_UID:-50000}:${AIRFLOW_GID:-0}"
+  depends_on:
+    &airflow-common-depends-on
+    redis:
+      condition: service_healthy
+    postgres:
+      condition: service_healthy
+
+services:
+  ## ----------------------
+  ## PERMISSION FIX SERVICE
+  ## Runs once (as root) to chown host bind-mounts and named volumes
+  ## ----------------------
+  fix-perms:
+    image: alpine:3.18
+    platform: linux/amd64  # Added for ARM64 compatibility
+    container_name: fix-perms
+    user: "0:0"
+    command: >
+      /bin/sh -c "
+      set -e;
+      echo 'Fixing ownership for Airflow dirs and volumes...';
+      # chown bind-mounted Airflow directories
+      mkdir -p /opt/airflow/{dags,logs,plugins,config} || true;
+      chown -R ${AIRFLOW_UID:-50000}:${AIRFLOW_GID:-0} /opt/airflow || true;
+      # If postgres & minio named volumes are mounted here, try chowning them too
+      mkdir -p /var/lib/postgresql/data || true;
+      chown -R 999:999 /var/lib/postgresql/data || true;  # Fixed: postgres uses UID 999
+      mkdir -p /data || true;
+      chown -R ${AIRFLOW_UID:-50000}:${AIRFLOW_GID:-0} /data || true;
+      echo 'Ownership fixed'; 
+      sleep 1;
+      "
+    # mount same paths so chown affects host bind mounts and named volumes
+    volumes:
+      - ${AIRFLOW_PROJ_DIR:-.}/dags:/opt/airflow/dags
+      - ${AIRFLOW_PROJ_DIR:-.}/logs:/opt/airflow/logs
+      - ${AIRFLOW_PROJ_DIR:-.}/plugins:/opt/airflow/plugins
+      - ${AIRFLOW_PROJ_DIR:-.}/config:/opt/airflow/config
+      - postgres-db-volume:/var/lib/postgresql/data
+      - minio_data:/data
+    networks:
+      - fraud-detection
+    restart: "no"
+
+  ## ----------------------
+  ## Postgres & Redis
+  ## ----------------------
+  postgres:
+    image: postgres:13
+    platform: linux/amd64  # Added for ARM64 compatibility
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+    volumes:
+      - postgres-db-volume:/var/lib/postgresql/data
+      - ./init-multiple-dbs.sh:/docker-entrypoint-initdb.d/init-multiple-dbs.sh
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "airflow"]
+      interval: 10s
+      retries: 5
+      start_period: 5s
+    restart: always
+    networks:
+      - fraud-detection
+
+  redis:
+    image: redis:7.2-bookworm
+    platform: linux/amd64  # Added for ARM64 compatibility
+    expose:
+      - 6379
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 30s
+      retries: 50
+      start_period: 30s
+    restart: always
+    networks:
+      - fraud-detection
+
+  ## ----------------------
+  ## Airflow services (webserver, scheduler, worker, triggerer, etc)
+  ## Each still inherits x-airflow-common; ensure airflow-init depends on fix-perms
+  ## ----------------------
+  airflow-webserver:
+    <<: *airflow-common
+    command: webserver
+    ports:
+      - "8080:8080"
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: always
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+    networks:
+      - fraud-detection
+
+  airflow-scheduler:
+    <<: *airflow-common
+    command: scheduler
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8974/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: always
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+    networks:
+      - fraud-detection
+
+  airflow-worker:
+    <<: *airflow-common
+    command: celery worker
+    healthcheck:
+      test:
+        - "CMD-SHELL"
+        - 'celery --app airflow.providers.celery.executors.celery_executor.app inspect ping -d "celery@$${HOSTNAME}" || celery --app airflow.executors.celery_executor.app inspect ping -d "celery@$${HOSTNAME}"'
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    environment:
+      <<: *airflow-common-env
+      DUMB_INIT_SETSID: "0"
+    restart: always
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+    deploy:
+      mode: replicated
+      replicas: 2
+    networks:
+      - fraud-detection
+
+  airflow-triggerer:
+    <<: *airflow-common
+    command: triggerer
+    healthcheck:
+      test: ["CMD-SHELL", 'airflow jobs check --job-type TriggererJob --hostname "$${HOSTNAME}"']
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: always
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+    networks:
+      - fraud-detection
+
+  airflow-init:
+    <<: *airflow-common
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        if [[ -z "${AIRFLOW_UID}" ]]; then
+          echo
+          echo -e "\033[1;33mWARNING!!!: AIRFLOW_UID not set!\e[0m"
+          echo "If you are on Linux, you SHOULD follow the instructions below to set "
+          echo "AIRFLOW_UID environment variable, otherwise files will be owned by root."
+          echo
+        fi
+        echo "Creating missing opt dirs if missing:"
+        mkdir -p /opt/airflow/{logs,dags,plugins,config}
+        mkdir -p /opt/airflow/logs/dag_processor_manager  # Explicitly create this directory
+        echo "Files in shared volumes before chown:"
+        ls -la /opt/airflow/{logs,dags,plugins,config} || true
+        echo "Change ownership of files in /opt/airflow to ${AIRFLOW_UID}:0"
+        chown -R "${AIRFLOW_UID}:0" /opt/airflow/ || true
+        echo "Change ownership of files in shared volumes to ${AIRFLOW_UID}:0"
+        chown -R "${AIRFLOW_UID}:0" /opt/airflow/{logs,dags,plugins,config} || true
+        echo "Files in shared volumes after chown:"
+        ls -la /opt/airflow/{logs,dags,plugins,config} || true
+        echo "Initialize the database..."
+        /entrypoint airflow db init
+        echo "Create admin user..."
+        /entrypoint airflow users create \
+          --username ${_AIRFLOW_WWW_USER_USERNAME:-airflow} \
+          --firstname Admin \
+          --lastname User \
+          --role Admin \
+          --email admin@example.com \
+          --password ${_AIRFLOW_WWW_USER_PASSWORD:-airflow}
+    environment:
+      <<: *airflow-common-env
+      _AIRFLOW_DB_MIGRATE: 'true'
+      _AIRFLOW_WWW_USER_CREATE: 'true'
+      _AIRFLOW_WWW_USER_USERNAME: ${_AIRFLOW_WWW_USER_USERNAME:-airflow}
+      _AIRFLOW_WWW_USER_PASSWORD: ${_AIRFLOW_WWW_USER_PASSWORD:-airflow}
+      _PIP_ADDITIONAL_REQUIREMENTS: ''
+    # run as root for init (same as original)
+    user: "0:0"
+    depends_on:
+      # ensure permissions fix runs before init
+      fix-perms:
+        condition: service_completed_successfully
+      <<: *airflow-common-depends-on
+    networks:
+      - fraud-detection
+
+  airflow-cli:
+    <<: *airflow-common
+    profiles:
+      - debug
+    environment:
+      <<: *airflow-common-env
+      CONNECTION_CHECK_MAX_COUNT: "0"
+    command:
+      - bash
+      - -c
+      - airflow
+    depends_on:
+      <<: *airflow-common-depends-on
+    networks:
+      - fraud-detection
+
+  flower:
+    <<: *airflow-common
+    command: celery flower
+    profiles:
+      - flower
+    ports:
+      - "5555:5555"
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:5555/"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: always
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+    networks:
+      - fraud-detection
+
+  # MinIO Server
+  minio:
+    restart: always
+    image: minio/minio
+    platform: linux/amd64  # Added for ARM64 compatibility
+    container_name: mlflow_s3
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    command: server /data --console-address ':9001' --address ':9000'
+    environment:
+      - MINIO_ROOT_USER=${MINIO_USERNAME:-minioadmin}
+      - MINIO_ROOT_PASSWORD=${MINIO_PASSWORD:-minioadmin123}
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+    networks:
+      - fraud-detection
+
+  # MinIO Client - Initialize buckets
+  mc:
+    image: minio/mc
+    platform: linux/amd64  # Added for ARM64 compatibility
+    depends_on:
+      minio:
+        condition: service_healthy
+    container_name: mc
+    environment:
+      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID:-minioadmin}
+      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY:-minioadmin123}
+    entrypoint: >
+     /bin/sh -c '
+     /tmp/wait-for-it.sh minio:9000 --timeout=60 &&
+     /usr/bin/mc alias set minio http://minio:9000 ${AWS_ACCESS_KEY_ID} ${AWS_SECRET_ACCESS_KEY} &&
+     /usr/bin/mc mb minio/mlflow || true;
+     exit 0;
+     '
+    volumes:
+      - ./wait-for-it.sh:/tmp/wait-for-it.sh
+    networks:
+      - fraud-detection
+
+  # MLflow Server
+  mlflow-server:
+    restart: always
+    build: ./mlflow
+    image: mlflow-server
+    platform: linux/amd64  # Added for ARM64 compatibility
+    container_name: mlflow-server
+    depends_on:
+      - mc
+      - postgres
+    ports:
+      - "5500:5500"
+    environment:
+      - MLFLOW_S3_ENDPOINT_URL=http://minio:9000
+      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID:-minioadmin}
+      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY:-minioadmin123}
+    command: mlflow server --port 5500 --host 0.0.0.0 --backend-store-uri postgresql+psycopg2://mlflow:mlflow@postgres/mlflow --default-artifact-root s3://mlflow
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5500/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    networks:
+      - fraud-detection
+
+  producer:
+    build: ./producer
+    env_file: .env
+    environment:
+      - AIRFLOW_UID=${AIRFLOW_UID}
+      - AIRFLOW_GID=${AIRFLOW_GID}
+    deploy:
+      replicas: 2
+      resources:
+        limits:
+          cpus: '1'
+          memory: "1G"
+    networks:
+      - fraud-detection
+
+
+volumes:
+  postgres-db-volume:
+  minio_data:
+
+networks:
+  fraud-detection:
+    driver: bridge
