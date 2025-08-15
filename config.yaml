@@ -4,15 +4,20 @@ mlflow:
   tracking_uri: "http://mlflow-server:5500"
   artifact_location: "s3://mlflow/fraud_Detection"
   s3_endpoint_url: "http://minio:9000"
+  bucket: "mlflow"
 
 kafka:
-  
+  bootstrap_servers: "pkc-921jm.us-east-2.aws.confluent.cloud:9092"
+  username: "6XLYXSMXRMG6WKSR"
+  password: "cflthZ3YLLbyxHy/i6DTLZlIk+0/UL0dF0/QkGKcMbyh6orU4NRCKSzo2d8yFpPw"
+  topic: "transactions"
+  output_topic: "fraud_predictions"
 
-features:
+#features:
 
 
-modlel:
+#modlel:
 
 
-spark:
+#spark:
 

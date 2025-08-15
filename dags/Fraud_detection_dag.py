@@ -16,7 +16,15 @@ default_args = {
 
 def _train_model(**context):
     """Airflow wrapper for training task"""
-    pass
+    from fraud_detection_training import FraudDetectionTraining
+    try:
+        logger.info('Intitalzing fraud detection training')
+        trainer = FraudDetectionTraining()
+
+        return {'status':'success'}
+    except Exception as e:
+        logger.error('Training failed: %s', str(e), exc_info=True)
+        raise AirflowException(f'Model Training Failed: {str(e)}')
 
 with DAG(
     'fraud_detection_training',
