@@ -3,6 +3,7 @@ import json
 import logging
 import boto3
 from dotenv import load_dotenv
+from matplotlib import pyplot as plt
 import mlflow
 import numpy as np
 from sklearn.compose import ColumnTransformer
@@ -19,7 +20,7 @@ import numpy as np
 import mlflow
 from imblearn.pipeline import Pipeline
 from imblearn.over_sampling import SMOTE
-from sklearn.metrics import average_precision_score, classification_report, f1_score, fbeta_score, make_scorer, precision_recall_curve, precision_score, recall_score, roc_auc_score
+from sklearn.metrics import average_precision_score, classification_report, confusion_matrix, f1_score, fbeta_score, make_scorer, precision_recall_curve, precision_score, recall_score, roc_auc_score
 
 logging.basicConfig(
     format="%(asctime)s - %(levelname)s - %(module)s - %(message)s",
@@ -316,6 +317,26 @@ class FraudDetectionTraining:
 
                 mlflow.log_metrics(metrics)
                 mlflow.log_params(best_params)
+
+                cm = confusion_matrix(y_test,y_pred)
+                plt.figure(figsize=(6,4))
+                plt.imshow(cm, interpolation='nearest', cmap=plt.cm.Blues)
+                plt.title('Confusion matrix')
+                plt.colorbar()
+                tick_marks = np.arange(2)
+                plt.xticks(tick_marks, ['Not Fraud', 'Fraud'])
+                plt.yticks(tick_marks, ['Not Fraud', 'Fraud'])
+
+                for i in range(2):
+                    for j in range(2):
+                        plt.text(j,i, format(cm[i,j],'d'), ha='center', va='center', color='red')
+                
+                plt.tight_layout()
+                cm_filename = 'confusion_matrix.png'
+                plt.savefig(cm_filename)
+                mlflow.log_artifact(cm_filename)
+                plt.close()
+
 
         except Exception as e:
             logger.error('Training failed: %s', str(e), exc_info=True)
