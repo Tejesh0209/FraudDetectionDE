@@ -2,6 +2,7 @@ from datetime import datetime, timedelta
 from airflow import DAG
 from airflow.operators.python import PythonOperator
 from airflow.operators.bash import BashOperator
+from airflow.exceptions import AirflowException
 import logging
 
 logger = logging.getLogger(__name__)
@@ -12,17 +13,22 @@ default_args = {
     'start_date': datetime(2025, 8, 14),
     'execution_timeout': timedelta(minutes=120),
     'max_active_runs': 1,
+    'retries': 1,
+    'retry_delay': timedelta(minutes=5)
 }
 
 def _train_model(**context):
     """Airflow wrapper for training task"""
+    import sys
+    sys.path.append('/opt/airflow/dags')
+    
     from fraud_detection_training import FraudDetectionTraining
     try:
-        logger.info('Intitalzing fraud detection training')
+        logger.info('Initializing fraud detection training')
         trainer = FraudDetectionTraining()
         model, precision = trainer.train_model()
 
-        return {'status':'success', 'precision':'precision'}
+        return {'status': 'success', 'precision': precision}
     except Exception as e:
         logger.error('Training failed: %s', str(e), exc_info=True)
         raise AirflowException(f'Model Training Failed: {str(e)}')
@@ -53,14 +59,14 @@ with DAG(
 
     cleanup_task = BashOperator(
         task_id='cleanup_resources',
-        bash_command='rm -f /app/tmp/*.pkl',
+        bash_command='rm -f /app/tmp/*.pkl /app/*.png || true',
         trigger_rule='all_done'
     )
 
     validate_environment >> training_task >> cleanup_task
 
     dag.doc_md = """
-    ## Fraud Detection pipeline
+    ## Fraud Detection Pipeline
 
     Daily Training of fraud detection model using:
     - Transaction data from Kafka

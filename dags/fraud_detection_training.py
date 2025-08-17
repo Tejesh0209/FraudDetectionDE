@@ -18,6 +18,7 @@ from sklearn.preprocessing import OrdinalEncoder
 from xgboost import XGBClassifier
 import numpy as np
 import mlflow
+from mlflow.models.signature import infer_signature
 from imblearn.pipeline import Pipeline
 from imblearn.over_sampling import SMOTE
 from sklearn.metrics import average_precision_score, classification_report, confusion_matrix, f1_score, fbeta_score, make_scorer, precision_recall_curve, precision_score, recall_score, roc_auc_score
@@ -65,6 +66,8 @@ class FraudDetectionTraining:
             # sanity defaults
             config.setdefault('kafka', {})
             config.setdefault('mlflow', {})
+            config.setdefault('model', {})
+            config['model'].setdefault('param', {})
             return config
         except Exception as e:
             logger.error('Failed to load configuration: %s', str(e))
@@ -102,45 +105,86 @@ class FraudDetectionTraining:
             logger.error('MinIO connection failed: %s', str(e))
 
     def read_from_kafka(self) -> pd.DataFrame:
-        """Read JSON messages from Kafka topic -> DataFrame"""
+        """Read JSON messages from Kafka topic -> DataFrame with improved Confluent Cloud support"""
         consumer = None
         try:
             kcfg = self.config['kafka']
-            topic = kcfg['topic']
+            topic = kcfg.get('topic') or os.getenv('KAFKA_TOPIC', 'transactions')
             logger.info('Connecting to Kafka topic: %s', topic)
 
-            consumer = KafkaConsumer(
-                topic,
-                bootstrap_servers=kcfg.get('bootstrap_servers') or os.getenv('KAFKA_BOOTSTRAP_SERVERS', '').split(','),
-                security_protocol='SASL_SSL',
-                sasl_mechanism='PLAIN',
-                sasl_plain_username=os.getenv('KAFKA_USERNAME'),
-                sasl_plain_password=os.getenv('KAFKA_PASSWORD'),
-                value_deserializer=lambda x: json.loads(x.decode('utf-8')),
-                auto_offset_reset=kcfg.get('auto_offset_reset', 'earliest'),
-                enable_auto_commit=False,
-                consumer_timeout_ms=int(kcfg.get('timeout', 10000))
-            )
+            # Enhanced Kafka configuration for Confluent Cloud
+            kafka_config = {
+                'bootstrap_servers': os.getenv('KAFKA_BOOTSTRAP_SERVERS').split(','),
+                'security_protocol': os.getenv('KAFKA_SECURITY_PROTOCOL', 'SASL_SSL'),
+                'sasl_mechanism': os.getenv('KAFKA_SASL_MECHANISM', 'PLAIN'),
+                'sasl_plain_username': os.getenv('KAFKA_USERNAME'),
+                'sasl_plain_password': os.getenv('KAFKA_PASSWORD'),
+                'ssl_check_hostname': False,
+                'ssl_ca_location': None,
+                'value_deserializer': lambda x: json.loads(x.decode('utf-8')),
+                'key_deserializer': lambda x: x.decode('utf-8') if x else None,
+                'auto_offset_reset': kcfg.get('auto_offset_reset', 'earliest'),
+                'enable_auto_commit': False,
+                'consumer_timeout_ms': int(os.getenv('KAFKA_REQUEST_TIMEOUT_MS', '40000')),
+                'session_timeout_ms': int(os.getenv('KAFKA_SESSION_TIMEOUT_MS', '30000')),
+                'heartbeat_interval_ms': 10000,
+                'max_poll_records': 100,
+                'fetch_max_bytes': 52428800,  # 50MB
+                'max_partition_fetch_bytes': 1048576,  # 1MB
+                'fetch_max_wait_ms': 500,
+                'group_id': f'fraud-detection-training-{int(time.time())}',
+                'client_id': 'fraud-detection-consumer'
+            }
 
-            messages = [msg.value for msg in consumer]
-            if consumer is not None:
-                consumer.close()
+            consumer = KafkaConsumer(topic, **kafka_config)
+            
+            logger.info('Connected to Kafka, waiting for messages...')
+            messages = []
+            message_count = 0
+            max_messages = 1000  # Limit to prevent memory issues
+            
+            for msg in consumer:
+                try:
+                    messages.append(msg.value)
+                    message_count += 1
+                    
+                    if message_count % 100 == 0:
+                        logger.info(f'Received {message_count} messages...')
+                    
+                    if message_count >= max_messages:
+                        logger.info(f'Reached max messages limit: {max_messages}')
+                        break
+                        
+                except json.JSONDecodeError as e:
+                    logger.warning(f'Failed to decode message: {e}')
+                    continue
+                except Exception as e:
+                    logger.error(f'Error processing message: {e}')
+                    continue
 
             if not messages:
-                raise ValueError('No messages received from Kafka')
+                raise ValueError('No valid messages received from Kafka')
 
             df = pd.DataFrame(messages)
-            # required columns sanity
-            if 'timestamp' in df.columns:
-                df['timestamp'] = pd.to_datetime(df['timestamp'], utc=True, errors='coerce')
-            else:
-                raise ValueError('Missing "timestamp" in Kafka data')
+            logger.info(f'Successfully parsed {len(df)} messages from Kafka')
+            
+            # Validate required columns
+            required_cols = ['timestamp', 'is_fraud', 'amount', 'user_id']
+            missing_cols = [col for col in required_cols if col not in df.columns]
+            if missing_cols:
+                raise ValueError(f'Missing required columns in Kafka data: {missing_cols}')
 
-            if 'is_fraud' not in df.columns:
-                raise ValueError('Fraud label "is_fraud" is missing from Kafka data')
+            # Process timestamp
+            df['timestamp'] = pd.to_datetime(df['timestamp'], utc=True, errors='coerce')
+            
+            # Remove rows with invalid timestamps
+            invalid_timestamps = df['timestamp'].isna().sum()
+            if invalid_timestamps > 0:
+                logger.warning(f'Removing {invalid_timestamps} rows with invalid timestamps')
+                df = df.dropna(subset=['timestamp'])
 
             fraud_rate = float(df['is_fraud'].mean() * 100.0)
-            logger.info(f'Kafka data read successfully. Fraud rate: {fraud_rate:.2f}%')
+            logger.info(f'Kafka data processed successfully. Records: {len(df)}, Fraud rate: {fraud_rate:.2f}%')
 
             return df
 
@@ -151,6 +195,7 @@ class FraudDetectionTraining:
             if consumer is not None:
                 try:
                     consumer.close()
+                    logger.info('Kafka consumer closed successfully')
                 except Exception:
                     pass
 
@@ -256,7 +301,7 @@ class FraudDetectionTraining:
                     eval_metric='aucpr',
                     random_state=self.config['model'].get('seed', 42),
                     reg_lambda=1.0,
-                    n_estimators=self.config['model']['param']['n_estimators'],
+                    n_estimators=self.config['model']['param'].get('n_estimators', 100),
                     n_jobs=-1,
                     tree_method=self.config['model'].get('tree_method', 'hist')
                 )
@@ -281,7 +326,7 @@ class FraudDetectionTraining:
                     pipeline,
                     param_dist,
                     n_iter=20,
-                    scoring=make_scorer(fbeta_score, beta=2, zer_division=0),
+                    scoring=make_scorer(fbeta_score, beta=2, zero_division=0),
                     cv=StratifiedKFold(n_splits=3, shuffle=True),
                     n_jobs=-1,
                     refit=True,
@@ -301,8 +346,9 @@ class FraudDetectionTraining:
                 best_threshold = thresholds_arr[np.argmax(f1_scores)]
                 logger.info('Optimal threshold determined: %.4f', best_threshold)
 
-                X_test_processed = best_model.named_steps=['preprocessor'].transform(X_test)
-
+                # Fixed: proper pipeline step access
+                X_test_processed = best_model.named_steps['preprocessor'].transform(X_test)
+                # Apply SMOTE only on training data, not test data
                 test_proba = best_model.named_steps['classifier'].predict_proba(X_test_processed)[:,1]
 
                 y_pred  = (test_proba >= best_threshold).astype(int)
@@ -337,11 +383,29 @@ class FraudDetectionTraining:
                 mlflow.log_artifact(cm_filename)
                 plt.close()
 
+                # Fixed: figsize parameter
+                plt.figure(figsize=(10,6))
+                plt.plot(recall_arr, precision_arr, marker ='.', label='Precision-Recall')
+                plt.xlabel('Recall')
+                plt.ylabel('Precision')
+                plt.title('Precision Recall Curve')
+                plt.legend()
+                pr_filename = 'precision_recall_curve.png' 
+                plt.savefig(pr_filename)
+                mlflow.log_artifact(pr_filename)
+                plt.close()
+
+                signature = infer_signature(X_train, y_pred)
+                mlflow.sklearn.log_model(
+                    sk_model=best_model,
+                    artifact_path='model',
+                    signature=signature,
+                    registered_model_name='fraud_detection_model'
+                )
+
+                logger.info('Training successfully completed with metrics: %s', metrics)
+                return best_model, metrics['precision']
 
         except Exception as e:
             logger.error('Training failed: %s', str(e), exc_info=True)
             raise
-
-
-
-

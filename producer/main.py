@@ -51,20 +51,29 @@ class TransactionProducer:
         # Confluent Kafka config
         self.producer_config = {
             'bootstrap.servers': self.bootstrap_servers,
-            'client.id': 'transaction-producer',
-            'compression.type': 'gzip',
-            'linger.ms': '5',
-            'batch.size': 16384,
+            'client.id': 'fraud-detection-producer',
+            'compression.type': 'snappy',
+            'linger.ms': 10,
+            'batch.size': 32768,
+            'buffer.memory': 33554432,
+            'max.request.size': 1048576,  # 1MB max message size
+            'request.timeout.ms': 30000,
+            'retry.backoff.ms': 100,
+            'retries': 5,
+            'acks': 'all',
+            'security.protocol': os.getenv('KAFKA_SECURITY_PROTOCOL', 'SASL_SSL'),
+            'sasl.mechanism': os.getenv('KAFKA_SASL_MECHANISM', 'PLAIN'),
         }
 
+        # Add authentication if credentials are provided
         if self.kafka_username and self.kafka_password:
             self.producer_config.update({
-                'security.protocol': 'SASL_SSL',
-                'sasl.mechanism': 'PLAIN',
                 'sasl.username': self.kafka_username,
                 'sasl.password': self.kafka_password,
             })
+            logger.info('Using SASL authentication for Confluent Cloud')
         else:
+            logger.warning('No Kafka credentials provided, using PLAINTEXT')
             self.producer_config['security.protocol'] = 'PLAINTEXT'
 
         try:
